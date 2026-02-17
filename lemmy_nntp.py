@@ -199,6 +199,14 @@ def _format_date(iso):
 def _safe(text):
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text or "")
 
+def _format_author(creator, domain):
+    """Format author From header, marking banned users."""
+    name = creator.get("name", "unknown")
+    banned = creator.get("banned", False)
+    if banned:
+        return f"{name} [banned] <{name}@{domain}>"
+    return f"{name} <{name}@{domain}>"
+
 def convert_body(md, post_url=None):
     links, header_lines = [], []
     if post_url:
@@ -306,6 +314,20 @@ class Spool:
             self._save_index(ng, idx)
             return num
 
+    def update_article(self, ng, article):
+        """Update an existing article in-place (same number, same message-id).
+        Only overwrites the article file; does not touch the index."""
+        lock = self._group_lock(ng)
+        with lock:
+            mid = article["message_id"]
+            idx = self._load_index(ng)
+            if mid not in idx["mid_to_num"]:
+                return False
+            article["number"] = idx["mid_to_num"][mid]
+            (self._group_dir(ng) / self._art_fname(mid)).write_text(
+                json.dumps(article, ensure_ascii=False), encoding="utf-8")
+            return True
+
     def _load_art(self, ng, mid):
         p = self._group_dir(ng) / self._art_fname(mid)
         return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
@@ -412,14 +434,24 @@ class Poller:
             except Exception:
                 log.exception("Poller: error syncing %s", ng)
 
+    def _is_removed(self, item):
+        """Check if a post or comment has been removed or deleted."""
+        return item.get("removed", False) or item.get("deleted", False)
+
     def _sync_group(self, ng, community_name):
         posts = self.api.list_posts(community_name, limit=50, sort="New", token=self.token)
         if not posts: return
-        np, nc = 0, 0
+        np, nc, nu = 0, 0, 0
         for pv in reversed(posts):
             post = pv["post"]
+            creator = pv["creator"]
             post_mid = make_message_id("post", post["id"], self.domain)
+
             if self.spool.has_article(ng, post_mid):
+                # Check for edits, removals, or ban status changes
+                updated = self._check_and_update_post(ng, pv)
+                if updated:
+                    nu += 1
                 nc += self._sync_comments(ng, post["id"], post_mid,
                                           _safe(post.get("name","(no subject)")))
                 continue
@@ -427,8 +459,70 @@ class Poller:
             self.spool.store_article(ng, art)
             np += 1
             nc += self._sync_comments(ng, post["id"], post_mid, art["subject"])
-        if np or nc:
-            log.info("Poller: %s: +%d posts, +%d comments", ng, np, nc)
+        if np or nc or nu:
+            log.info("Poller: %s: +%d posts, +%d comments, ~%d updated", ng, np, nc, nu)
+
+    def _check_and_update_post(self, ng, pv):
+        """Compare a post from API with spool version; update if changed.
+        Returns True if the article was updated."""
+        post = pv["post"]
+        creator = pv["creator"]
+        post_mid = make_message_id("post", post["id"], self.domain)
+        existing = self.spool.get_article_by_mid(ng, post_mid)
+        if not existing:
+            return False
+
+        ex_headers = existing.get("extra_headers", {})
+        old_updated = ex_headers.get("X-Lemmy-Updated", "")
+        old_removed = ex_headers.get("X-Lemmy-Removed", "false")
+        old_banned = ex_headers.get("X-Lemmy-Author-Banned", "false")
+
+        new_updated = post.get("updated") or ""
+        new_removed = "true" if self._is_removed(post) else "false"
+        new_banned = "true" if creator.get("banned", False) else "false"
+
+        # Nothing changed
+        if (new_updated == old_updated and
+                new_removed == old_removed and
+                new_banned == old_banned):
+            return False
+
+        # Rebuild article with updated data
+        art = self._build_post(pv, ng)
+        self.spool.update_article(ng, art)
+        log.debug("Poller: updated post %s (updated=%s->%s removed=%s->%s banned=%s->%s)",
+                  post_mid, old_updated, new_updated, old_removed, new_removed, old_banned, new_banned)
+        return True
+
+    def _check_and_update_comment(self, ng, cv, post_mid, post_subject):
+        """Compare a comment from API with spool version; update if changed.
+        Returns True if the article was updated."""
+        comment = cv["comment"]
+        creator = cv["creator"]
+        mid = make_message_id("comment", comment["id"], self.domain)
+        existing = self.spool.get_article_by_mid(ng, mid)
+        if not existing:
+            return False
+
+        ex_headers = existing.get("extra_headers", {})
+        old_updated = ex_headers.get("X-Lemmy-Updated", "")
+        old_removed = ex_headers.get("X-Lemmy-Removed", "false")
+        old_banned = ex_headers.get("X-Lemmy-Author-Banned", "false")
+
+        new_updated = comment.get("updated") or ""
+        new_removed = "true" if self._is_removed(comment) else "false"
+        new_banned = "true" if creator.get("banned", False) else "false"
+
+        if (new_updated == old_updated and
+                new_removed == old_removed and
+                new_banned == old_banned):
+            return False
+
+        art = self._build_comment(cv, ng, post_mid, post_subject)
+        self.spool.update_article(ng, art)
+        log.debug("Poller: updated comment %s (updated=%s->%s removed=%s->%s banned=%s->%s)",
+                  mid, old_updated, new_updated, old_removed, new_removed, old_banned, new_banned)
+        return True
 
     def _sync_comments(self, ng, post_id, post_mid, post_subject):
         try:
@@ -439,40 +533,71 @@ class Poller:
         n = 0
         for cv in comments:
             mid = make_message_id("comment", cv["comment"]["id"], self.domain)
-            if self.spool.has_article(ng, mid): continue
+            if self.spool.has_article(ng, mid):
+                if self._check_and_update_comment(ng, cv, post_mid, post_subject):
+                    n += 1
+                continue
             self.spool.store_article(ng, self._build_comment(cv, ng, post_mid, post_subject))
             n += 1
         return n
 
     def _build_post(self, pv, ng):
         post, creator = pv["post"], pv["creator"]
-        body = convert_body(_safe(post.get("body","") or ""), post_url=post.get("url"))
-        if not body.strip(): body = "(no content)"
+        removed = self._is_removed(post)
+
+        if removed:
+            body = "[REMOVED]"
+        else:
+            body = convert_body(_safe(post.get("body","") or ""), post_url=post.get("url"))
+            if not body.strip(): body = "(no content)"
+
+        extra = {"X-Lemmy-Post-Id": str(post["id"]),
+                 "X-Lemmy-Score": str(pv.get("counts",{}).get("score",0)),
+                 "X-Lemmy-Author-Id": str(creator["id"]),
+                 "X-Lemmy-Author-Banned": "true" if creator.get("banned", False) else "false"}
+        if post.get("updated"):
+            extra["X-Lemmy-Updated"] = post["updated"]
+        if removed:
+            extra["X-Lemmy-Removed"] = "true"
+
         return dict(message_id=make_message_id("post", post["id"], self.domain),
                     newsgroup=ng, number=0,
                     subject=_safe(post.get("name","(no subject)")),
-                    author=f"{creator['name']} <{creator['name']}@{self.domain}>",
+                    author=_format_author(creator, self.domain),
                     date=_format_date(post.get("published","")),
                     references="", body=body,
-                    extra_headers={"X-Lemmy-Post-Id": str(post["id"]),
-                                   "X-Lemmy-Score": str(pv.get("counts",{}).get("score",0)),
-                                   "X-Lemmy-Author-Id": str(creator["id"])})
+                    extra_headers=extra)
 
     def _build_comment(self, cv, ng, post_mid, post_subject):
         comment, creator = cv["comment"], cv["creator"]
+        removed = self._is_removed(comment)
+
+        if removed:
+            body = "[REMOVED]"
+        else:
+            body = convert_body(_safe(comment.get("content","") or ""))
+
         refs = [post_mid]
         for pid in [int(x) for x in comment.get("path","0").split(".")[1:-1] if x.isdigit()]:
             refs.append(make_message_id("comment", pid, self.domain))
+
+        extra = {"X-Lemmy-Comment-Id": str(comment["id"]),
+                 "X-Lemmy-Score": str(cv.get("counts",{}).get("score",0)),
+                 "X-Lemmy-Author-Id": str(creator["id"]),
+                 "X-Lemmy-Author-Banned": "true" if creator.get("banned", False) else "false"}
+        if comment.get("updated"):
+            extra["X-Lemmy-Updated"] = comment["updated"]
+        if removed:
+            extra["X-Lemmy-Removed"] = "true"
+
         return dict(message_id=make_message_id("comment", comment["id"], self.domain),
                     newsgroup=ng, number=0,
                     subject=f"Re: {post_subject}",
-                    author=f"{creator['name']} <{creator['name']}@{self.domain}>",
+                    author=_format_author(creator, self.domain),
                     date=_format_date(comment.get("published","")),
                     references=" ".join(refs),
-                    body=convert_body(_safe(comment.get("content","") or "")),
-                    extra_headers={"X-Lemmy-Comment-Id": str(comment["id"]),
-                                   "X-Lemmy-Score": str(cv.get("counts",{}).get("score",0)),
-                                   "X-Lemmy-Author-Id": str(creator["id"])})
+                    body=body,
+                    extra_headers=extra)
 
     # --- Admin group sync ---
 
