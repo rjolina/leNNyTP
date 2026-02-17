@@ -1253,6 +1253,14 @@ class NNTPSession:
         try:
             reply_mid = in_reply_to or (references.split()[-1] if references else "")
             parsed = parse_message_id(reply_mid) if reply_mid else None
+
+            # Early reject if replying to a removed article
+            if reply_mid:
+                parent_art = self.spool.find_article_across_groups(reply_mid)
+                if parent_art and parent_art.get("extra_headers", {}).get("X-Lemmy-Removed") == "true":
+                    await self.send("441 Cannot reply to a removed article")
+                    return
+
             if parsed:
                 kind, item_id = parsed
                 if kind == "comment":
